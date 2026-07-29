@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 Flacarr - Streamlit web app
-Encode FLAC to level 8 + conditional rename/organize
+Encode FLAC to level 8 + conditional rename/organize + ReplayGain
 Designed to run on Unraid (or any server) on port 10069
 
 Features:
+- Full Process: one-button Encode → Rename → Gain pipeline
 - Encode to FLAC level 8 (in-place, recursive)
 - Skip files already marked as level 8
 - Conditional rename (no CD folder on single-disc)
-- Dry-run for rename
-- Log download
+- ReplayGain via rsgain (album + track, tag-only)
+- Dry-run modes throughout
+- Log download + rolling history
 - Dark mode / improved styling
 """
 
@@ -171,6 +173,8 @@ if "rename_history" not in st.session_state:
     st.session_state.rename_history = []
 if "gain_history" not in st.session_state:
     st.session_state.gain_history = []
+if "full_history" not in st.session_state:
+    st.session_state.full_history = []
 
 
 def append_history(history_key: str, entries: list[str]) -> None:
@@ -442,7 +446,7 @@ with st.sidebar:
         "Process",
         options=["Entire library", "One artist", "One album"],
         index=0,
-        help="Limit Encode and Rename to a smaller part of the library"
+        help="Limit Encode / Rename / Gain / Full Process to a smaller part of the library"
     )
 
     folder = None
@@ -520,14 +524,168 @@ with st.sidebar:
 # -------------------------------------------------
 # Main area – Tabs
 # -------------------------------------------------
-tab_encode, tab_rename, tab_gain, tab_enc_hist, tab_ren_hist, tab_gain_hist = st.tabs([
+tab_full, tab_encode, tab_rename, tab_gain, tab_enc_hist, tab_ren_hist, tab_gain_hist, tab_full_hist = st.tabs([
+    "Full Process",
     "Encode (Level 8)",
     "Rename / Organize",
     "Gain",
     "Encode History",
     "Rename History",
     "Gain History",
+    "Full History",
 ])
+
+# ========== FULL PROCESS TAB ==========
+with tab_full:
+    st.subheader("Full Process — Encode → Rename → Gain")
+    st.markdown("""
+    Runs the complete post-rip pipeline in one pass on the selected scope:
+
+    1. **Encode** — re-encode every FLAC to compression level 8 (lossless, in-place)
+    2. **Rename / Organize** — fix multi-disc `CD xx` folders (preserves Lidarr-style names)
+    3. **Gain** — write album + track ReplayGain tags via `rsgain` (tag-only)
+
+    Use **Dry Run** the first time. When Dry Run is off, all three steps modify files.
+    """)
+
+    full_dry = st.checkbox(
+        "Dry Run (preview only — no encodes, moves, or tags written)",
+        value=True,
+        key="full_dry_run",
+        help="Recommended for the first run on any new scope."
+    )
+    full_gain_skip = st.checkbox(
+        "Skip files that already have ReplayGain tags",
+        value=True,
+        key="full_gain_skip",
+        help="Passed to rsgain -S"
+    )
+
+    if not full_dry:
+        st.warning("⚠️ Dry Run is **off**. This will re-encode FLACs, move files, and write ReplayGain tags.")
+
+    if st.button("Start Full Process", type="primary", key="btn_full"):
+        if not folder or not folder.exists():
+            st.error("Please choose a valid scope in the sidebar.")
+        elif not root or not root.exists():
+            st.error("Library root is required (needed for Rename path logic).")
+        else:
+            combined_logs = []
+            combined_logs.append(f"=== FULL PROCESS  |  scope: {scope_label or folder}  |  dry={full_dry} ===")
+            combined_logs.append("")
+
+            # ---------- 1. ENCODE ----------
+            combined_logs.append("--- 1. ENCODE (Level 8) ---")
+            files = list(folder.rglob("*.flac"))
+            total = len(files)
+            enc_success = enc_skipped = enc_failed = 0
+
+            if total == 0:
+                combined_logs.append("No FLAC files found — skipping Encode.")
+            else:
+                log_placeholder = st.empty()
+                with st.spinner(f"{'Previewing' if full_dry else 'Encoding'} {total} files…"):
+                    for i, f in enumerate(files, 1):
+                        rel = f.relative_to(folder)
+                        if skip_level8 and is_already_level8(f):
+                            combined_logs.append(f"↷ SKIPPED (already level 8): {rel}")
+                            enc_skipped += 1
+                        elif full_dry:
+                            combined_logs.append(f"DRY  would encode: {rel}")
+                            enc_success += 1
+                        else:
+                            ok, msg = convert_to_level8(f)
+                            if ok:
+                                enc_success += 1
+                                combined_logs.append(f"✓ {rel}")
+                            else:
+                                enc_failed += 1
+                                combined_logs.append(f"✗ {rel} → {msg}")
+                        # live tail
+                        log_placeholder.code("\n".join(combined_logs[-25:]), language=None)
+
+            combined_logs.append(
+                f"Encode summary: {enc_success} converted/would-convert • {enc_skipped} skipped • {enc_failed} failed (total {total})"
+            )
+            combined_logs.append("")
+
+            # ---------- 2. RENAME ----------
+            combined_logs.append("--- 2. RENAME / ORGANIZE ---")
+            # Re-collect files in case Encode somehow affected names (it doesn't)
+            files = list(folder.rglob("*.flac"))
+            moves = []
+            base = root
+            for f in files:
+                target = build_target_path(f, base)
+                if target and target.resolve() != f.resolve():
+                    moves.append((f, target))
+
+            def rel_display(p: Path) -> str:
+                try:
+                    return str(p.relative_to(base))
+                except ValueError:
+                    return str(p)
+
+            ren_success = ren_failed = 0
+            if not moves:
+                combined_logs.append("All files already match the desired structure. Nothing to rename.")
+            else:
+                combined_logs.append(f"Found {len(moves)} file(s) to rename/move:")
+                for src, dst in moves:
+                    combined_logs.append(f"  {rel_display(src)}  →  {rel_display(dst)}")
+
+                if full_dry:
+                    combined_logs.append("DRY RUN — no files were moved.")
+                else:
+                    with st.spinner(f"Moving {len(moves)} files…"):
+                        for src, dst in moves:
+                            try:
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                if dst.exists():
+                                    combined_logs.append(f"↷ SKIPPED (exists): {rel_display(dst)}")
+                                    continue
+                                shutil.move(str(src), str(dst))
+                                ren_success += 1
+                                combined_logs.append(f"✓ moved {rel_display(src)}  →  {rel_display(dst)}")
+                            except Exception as e:
+                                ren_failed += 1
+                                combined_logs.append(f"✗ {src.name} → {e}")
+                    combined_logs.append(f"Rename summary: {ren_success} moved • {ren_failed} failed")
+            combined_logs.append("")
+
+            # ---------- 3. GAIN ----------
+            combined_logs.append("--- 3. GAIN (ReplayGain) ---")
+            with st.spinner("Running ReplayGain…"):
+                code, output = run_rsgain(folder, skip_existing=full_gain_skip, dry_run=full_dry)
+            gain_lines = output.splitlines() if output else []
+            if gain_lines:
+                combined_logs.extend(gain_lines[:400])
+                if len(gain_lines) > 400:
+                    combined_logs.append(f"... ({len(gain_lines) - 400} more lines truncated)")
+            else:
+                combined_logs.append("(no rsgain output)")
+            combined_logs.append(f"Gain exit code: {code}")
+            combined_logs.append("")
+            combined_logs.append("=== FULL PROCESS COMPLETE ===")
+
+            # Persist
+            st.session_state.encode_logs = [ln for ln in combined_logs if "ENCODE" in ln or ln.startswith(("✓", "✗", "↷", "DRY"))]
+            append_history("encode_history", [f"(full) {ln}" for ln in combined_logs if "ENCODE" in ln or "encode" in ln.lower() or ln.startswith(("✓", "✗", "↷"))])
+            append_history("rename_history", [f"(full) {ln}" for ln in combined_logs if "RENAME" in ln or "→" in ln or "moved" in ln])
+            append_history("gain_history", [f"(full) {ln}" for ln in gain_lines] if gain_lines else ["(full) no gain output"])
+            append_history("full_history", combined_logs)
+
+            # UI summary
+            if full_dry:
+                st.success("Dry Run finished — nothing was modified. Review the log below.")
+            else:
+                st.success(
+                    f"Full Process finished — Encode: {enc_success} ok / {enc_skipped} skip / {enc_failed} fail  •  "
+                    f"Rename: {ren_success} moved  •  Gain exit {code}"
+                )
+            st.code("\n".join(combined_logs), language=None)
+            make_log_download(combined_logs, "full_process")
+
 
 # ========== ENCODE TAB ==========
 with tab_encode:
@@ -757,4 +915,19 @@ with tab_gain_hist:
         make_log_download(hist, "gain_history")
         if st.button("Clear Gain History", type="secondary", key="clear_gain_hist"):
             st.session_state.gain_history = []
+            st.rerun()
+
+
+# ========== FULL HISTORY TAB ==========
+with tab_full_hist:
+    st.subheader("Full Process History")
+    hist = st.session_state.full_history
+    if not hist:
+        st.info("No full-process history yet. Run a Full Process job to populate this list.")
+    else:
+        st.caption(f"Showing last **{len(hist)}** of up to {HISTORY_LIMIT} entries (newest first)")
+        st.code("\n".join(hist), language=None)
+        make_log_download(hist, "full_history")
+        if st.button("Clear Full History", type="secondary", key="clear_full_hist"):
+            st.session_state.full_history = []
             st.rerun()
