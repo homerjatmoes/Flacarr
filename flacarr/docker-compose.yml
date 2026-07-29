@@ -1,0 +1,22 @@
+services:
+  flacarr:
+    build: .
+    container_name: flacarr
+    ports:
+      - "10069:10069"
+    volumes:
+      # Change the left side to match your Unraid music library path
+      - /mnt/user/Media/Music:/mnt/user/Media/Music
+    restart: unless-stopped
+    networks:
+      - media
+    labels:
+      net.unraid.docker.icon: "/mnt/user/appdata/flacarr/Flacarr.png"
+      net.unraid.docker.webui: "http://[IP]:[PORT:10069]"
+    # Optional: limit resources if desired
+    # mem_limit: 1g
+    # cpus: 2.0
+
+networks:
+  media:
+    external: true
