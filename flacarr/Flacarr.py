@@ -1080,15 +1080,16 @@ tab_full, tab_encode, tab_gain, tab_lrc, tab_empty, tab_desc, tab_history = st.t
 
 # ========== FULL PROCESS ==========
 with tab_full:
-    st.subheader("Full Process — Encode → Gain")
+    st.subheader("Full Process — Encode → Gain → Text Tags")
     st.markdown("""
     Runs the post-rip pipeline on the selected scope:
 
     1. **Encode** — FLAC → level 8; lossless WAV → FLAC level 8
     2. **Gain** — album + track ReplayGain tags via `rsgain` (tag-only)
+    3. **Text Tags** *(optional)* — remove Description / Comment / Notes
     """)
     st.markdown(
-        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, both steps modify files.</p>',
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, enabled steps modify files.</p>',
         unsafe_allow_html=True,
     )
 
@@ -1113,9 +1114,18 @@ with tab_full:
         value=True,
         key="full_delete_wav"
     )
+    full_text_tags = st.checkbox(
+        "Remove Description / Comment / Notes tags",
+        value=True,
+        key="full_text_tags",
+        help="Same cleanup as the Text Tags tab (DESCRIPTION, COMMENT, NOTES, NOTE, ID3 COMM)",
+    )
 
     if not full_dry:
-        st.warning("⚠️ Dry Run is **off**. This will re-encode audio and write ReplayGain tags.")
+        st.warning(
+            "⚠️ Dry Run is **off**. Enabled steps will re-encode audio, write ReplayGain tags, "
+            "and/or remove text tags."
+        )
 
     if st.button("Start Full Process", type="primary", key="btn_full"):
         if not folder or not folder.exists():
@@ -1224,14 +1234,72 @@ with tab_full:
                 if gain_lines:
                     error_logs.extend(gain_lines[-50:])
             combined_logs.append("")
+
+            # 3. TEXT TAGS (optional)
+            text_ok = text_fail = 0
+            if full_text_tags:
+                combined_logs.append("--- 3. TEXT TAGS (Description / Comment / Notes) ---")
+                with st.spinner("Scanning text tags…"):
+                    hits = collect_files_with_text_tags(folder)
+                combined_logs.append(f"Files with matching tags: {len(hits)}")
+                if not hits:
+                    combined_logs.append("Nothing to clean up.")
+                else:
+                    text_placeholder = st.empty()
+                    for i, (path, entries) in enumerate(hits, 1):
+                        try:
+                            rel = path.relative_to(folder)
+                        except ValueError:
+                            rel = path
+                        keys = ", ".join(k for k, _ in entries)
+                        if full_dry:
+                            line = f"DRY  would remove [{keys}]: {rel}"
+                            combined_logs.append(line)
+                            action_logs.append(line)
+                            text_ok += 1
+                        else:
+                            success, msg, removed = remove_text_tags(path)
+                            if success and removed:
+                                line = f"✓ removed [{', '.join(removed)}]: {rel}"
+                                combined_logs.append(line)
+                                action_logs.append(line)
+                                text_ok += 1
+                            elif success:
+                                line = f"↷ skipped (none found): {rel}"
+                                combined_logs.append(line)
+                            else:
+                                line = f"✗ {rel} → {msg}"
+                                combined_logs.append(line)
+                                error_logs.append(line)
+                                text_fail += 1
+                        if i % 20 == 0 or i == len(hits):
+                            text_placeholder.code(
+                                "\n".join(combined_logs[-LOG_PREVIEW_LINES:]), language=None
+                            )
+                    if full_dry:
+                        combined_logs.append(
+                            f"Text tags summary: {text_ok} would be cleaned"
+                        )
+                    else:
+                        combined_logs.append(
+                            f"Text tags summary: {text_ok} cleaned • {text_fail} failed"
+                        )
+                combined_logs.append("")
+            else:
+                combined_logs.append("--- 3. TEXT TAGS — skipped (checkbox off) ---")
+                combined_logs.append("")
+
             combined_logs.append("=== FULL PROCESS COMPLETE ===")
 
             if full_dry:
                 st.success("Dry Run finished — nothing was modified.")
             else:
+                text_note = ""
+                if full_text_tags:
+                    text_note = f"  •  Text tags: {text_ok} cleaned / {text_fail} fail"
                 st.success(
                     f"Full Process finished — Encode: {enc_success} ok / {enc_skipped} skip / {enc_failed} fail  •  "
-                    f"Gain exit {code}"
+                    f"Gain exit {code}{text_note}"
                 )
 
             show_scrollable_log(combined_logs)
