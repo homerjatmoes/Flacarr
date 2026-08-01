@@ -14,17 +14,21 @@ Features:
 - Dark theme
 """
 
+import io
 import os
 import subprocess
 import tempfile
 import shutil
+import uuid
 import wave
+import zipfile
 from datetime import datetime
 from pathlib import Path
 import streamlit as st
 
 try:
     from mutagen.flac import FLAC
+    from mutagen import File as MutagenFile
 except ImportError:
     st.error("mutagen is not installed. Run:  pip install mutagen")
     st.stop()
@@ -54,8 +58,19 @@ st.markdown("""
     div[data-testid="stToolbar"] {display: none !important;}
 
     .stApp, [data-testid="stAppViewContainer"] {
-        background-color: #0e1117 !important;
+        background-color: #0a0a0a !important;
         color: #fafafa !important;
+    }
+    [data-testid="stAppViewContainer"] > .main,
+    .main .block-container {
+        background-color: #0a0a0a !important;
+    }
+    .flacarr-dryrun-note {
+        color: #f0c000 !important;
+        font-size: 1.2rem !important;
+        font-weight: 700 !important;
+        line-height: 1.4 !important;
+        margin: 0.4rem 0 0.8rem 0 !important;
     }
     section[data-testid="stSidebar"] {
         background-color: #161b22;
@@ -147,31 +162,94 @@ else:
 # -------------------------------------------------
 # Session state
 # -------------------------------------------------
-HISTORY_LIMIT = 300
+ARTIFACTS_PER_TYPE = 20
+LOG_PREVIEW_LINES = 100
 
-if "encode_logs" not in st.session_state:
-    st.session_state.encode_logs = []
-if "encode_history" not in st.session_state:
-    st.session_state.encode_history = []
-if "gain_history" not in st.session_state:
-    st.session_state.gain_history = []
-if "full_history" not in st.session_state:
-    st.session_state.full_history = []
-if "lrc_history" not in st.session_state:
-    st.session_state.lrc_history = []
-if "empty_history" not in st.session_state:
-    st.session_state.empty_history = []
 if "empty_scan_results" not in st.session_state:
     st.session_state.empty_scan_results = []  # list of (path_str, files)
+if "log_artifacts" not in st.session_state:
+    # Each: {id, type, job, dry_run, ts, content, lines}
+    st.session_state.log_artifacts = []
+if "last_results" not in st.session_state:
+    # job_key -> {complete, action, errors, dry_run}
+    st.session_state.last_results = {}
+if "hist_clear_confirm" not in st.session_state:
+    st.session_state.hist_clear_confirm = False
 
 
-def append_history(history_key: str, entries: list[str]) -> None:
-    if not entries:
+def push_log_artifacts(
+    job: str,
+    dry_run: bool,
+    complete: list[str],
+    action: list[str],
+    errors: list[str],
+) -> None:
+    """Store downloadable log artifacts (max ARTIFACTS_PER_TYPE per type)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    arts: list[dict] = list(st.session_state.log_artifacts)
+
+    def _add(atype: str, lines: list[str]) -> None:
+        if not lines:
+            return
+        arts.insert(
+            0,
+            {
+                "id": str(uuid.uuid4())[:8],
+                "type": atype,
+                "job": job,
+                "dry_run": dry_run,
+                "ts": ts,
+                "content": "\n".join(lines),
+                "line_count": len(lines),
+            },
+        )
+
+    if dry_run:
+        _add("dry_run", complete)
+        _add("action", action)
+    else:
+        _add("complete", complete)
+        _add("action", action)
+        _add("errors", errors)
+
+    # Keep newest ARTIFACTS_PER_TYPE per type
+    counts: dict[str, int] = {}
+    trimmed: list[dict] = []
+    for a in arts:
+        t = a["type"]
+        counts[t] = counts.get(t, 0) + 1
+        if counts[t] <= ARTIFACTS_PER_TYPE:
+            trimmed.append(a)
+    st.session_state.log_artifacts = trimmed
+
+
+def store_last_results(
+    job_key: str,
+    complete: list[str],
+    action: list[str],
+    errors: list[str],
+    dry_run: bool,
+) -> None:
+    st.session_state.last_results[job_key] = {
+        "complete": complete,
+        "action": action,
+        "errors": errors,
+        "dry_run": dry_run,
+    }
+
+
+def show_scrollable_log(lines: list[str], max_lines: int = LOG_PREVIEW_LINES) -> None:
+    """Show at most max_lines in a fixed-height scrollable code block."""
+    if not lines:
+        st.caption("No log lines.")
         return
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    stamped = [f"[{stamp}] {line}" for line in entries]
-    combined = stamped + st.session_state[history_key]
-    st.session_state[history_key] = combined[:HISTORY_LIMIT]
+    tail = lines[-max_lines:]
+    st.code("\n".join(tail), language=None)
+    if len(lines) > max_lines:
+        st.caption(
+            f"Preview: last **{max_lines}** of **{len(lines)}** lines — "
+            "download **Complete log** for the full output."
+        )
 
 
 # -------------------------------------------------
@@ -183,6 +261,26 @@ def get_tag(audio, key, default=""):
     if value:
         return str(value[0]).strip()
     return default
+
+
+def has_replaygain_tags(file_path: Path) -> bool:
+    """True if file already has ReplayGain (or R128) tags."""
+    try:
+        audio = MutagenFile(file_path, easy=False)
+        if audio is None:
+            return False
+        keys: list[str] = []
+        if getattr(audio, "tags", None) is not None:
+            keys.extend(str(k) for k in audio.tags.keys())
+        # FLAC / Vorbis-style
+        try:
+            keys.extend(str(k) for k in audio.keys())
+        except Exception:
+            pass
+        blob = " ".join(keys).upper()
+        return "REPLAYGAIN" in blob or "R128_" in blob
+    except Exception:
+        return False
 
 
 def is_already_level8(file_path: Path) -> bool:
@@ -382,6 +480,33 @@ def find_orphan_lrcs(folder: Path) -> list[Path]:
     return sorted(orphans)
 
 
+# Top-level / folder names to never treat as artists or albums (case-insensitive)
+EMPTY_IGNORE_NAMES = {
+    "artist pictures",
+    "podcasts",
+}
+
+
+def is_ignored_dir_name(name: str) -> bool:
+    """Hidden (.) folders and configured ignore names."""
+    if not name or name.startswith("."):
+        return True
+    return name.strip().lower() in EMPTY_IGNORE_NAMES
+
+
+def is_ignored_path(path: Path, library_root: Path | None = None) -> bool:
+    """True if path or any component under library_root should be skipped."""
+    if is_ignored_dir_name(path.name):
+        return True
+    if library_root is None:
+        return False
+    try:
+        rel = path.resolve().relative_to(library_root.resolve())
+    except Exception:
+        return False
+    return any(is_ignored_dir_name(part) for part in rel.parts)
+
+
 def subtree_has_audio(dir_path: Path) -> bool:
     """True if any audio file exists under dir_path (recursive)."""
     try:
@@ -394,18 +519,25 @@ def subtree_has_audio(dir_path: Path) -> bool:
 
 
 def list_subtree_files(dir_path: Path, limit: int = 40) -> list[str]:
-    """Relative file paths under dir_path (for display)."""
+    """Relative file paths under dir_path (for display). Skips hidden path parts."""
     files: list[str] = []
     try:
         for p in sorted(dir_path.rglob("*")):
-            if p.is_file():
-                try:
-                    files.append(str(p.relative_to(dir_path)))
-                except ValueError:
-                    files.append(p.name)
-                if len(files) >= limit:
-                    files.append("…")
-                    break
+            if not p.is_file():
+                continue
+            # Skip files inside hidden subfolders
+            try:
+                rel = p.relative_to(dir_path)
+                if any(part.startswith(".") for part in rel.parts):
+                    continue
+                files.append(str(rel))
+            except ValueError:
+                if p.name.startswith("."):
+                    continue
+                files.append(p.name)
+            if len(files) >= limit:
+                files.append("…")
+                break
     except Exception:
         pass
     return files
@@ -417,13 +549,15 @@ def find_silent_album_folders(scope: Path, library_root: Path) -> list[tuple[Pat
     - Library root scope → Artist/Album
     - Artist scope → each album under that artist
     - Album scope → that folder only (if silent)
+
+    Skips hidden folders (e.g. .whipper_logs), Artist Pictures, and Podcasts.
     """
     results: list[tuple[Path, list[str]]] = []
 
     def consider(album_path: Path) -> None:
         if not album_path.is_dir():
             return
-        if album_path.name.startswith("."):
+        if is_ignored_path(album_path, library_root):
             return
         if subtree_has_audio(album_path):
             return
@@ -438,12 +572,18 @@ def find_silent_album_folders(scope: Path, library_root: Path) -> list[tuple[Pat
     try:
         if depth == 0:
             for artist in sorted(scope.iterdir()):
-                if not artist.is_dir() or artist.name.startswith("."):
+                if not artist.is_dir() or is_ignored_dir_name(artist.name):
                     continue
                 for album in sorted(artist.iterdir()):
+                    if not album.is_dir() or is_ignored_dir_name(album.name):
+                        continue
                     consider(album)
         elif depth == 1:
+            if is_ignored_path(scope, library_root):
+                return results
             for album in sorted(scope.iterdir()):
+                if not album.is_dir() or is_ignored_dir_name(album.name):
+                    continue
                 consider(album)
         else:
             consider(scope)
@@ -453,51 +593,214 @@ def find_silent_album_folders(scope: Path, library_root: Path) -> list[tuple[Pat
     return results
 
 
-def run_rsgain(target: Path, skip_existing: bool, dry_run: bool) -> tuple[int, str]:
+def run_rsgain(
+    target: Path,
+    skip_existing: bool,
+    dry_run: bool,
+    log_placeholder=None,
+    jobs: int | None = None,
+) -> tuple[int, str]:
+    """
+    Run ReplayGain. Dry-run lists files that would be processed and honors skip_existing
+    by checking tags. Live run streams output into log_placeholder when provided.
+    jobs: max parallel rsgain workers (-m); defaults to all visible CPUs.
+    """
+    max_cpus = os.cpu_count() or 2
+    worker_count = max(1, min(int(jobs or max_cpus), max_cpus))
+
     if dry_run:
         files = [
             p for p in target.rglob("*")
             if p.is_file() and p.suffix.lower() in GAIN_EXTENSIONS
         ]
+        if skip_existing:
+            to_process = [p for p in files if not has_replaygain_tags(p)]
+            skipped = len(files) - len(to_process)
+        else:
+            to_process = files
+            skipped = 0
+
         lines = [
-            f"DRY RUN — would process {len(files)} supported audio file(s) under {target}",
+            f"DRY RUN — would process {len(to_process)} supported audio file(s) under {target}",
+            f"Already tagged (skipped): {skipped}" if skip_existing else "Skip existing: no",
             "Mode: album + track ReplayGain (tag-only)",
             f"Skip existing: {'yes' if skip_existing else 'no'}",
+            f"Parallel jobs (-m): {worker_count} of {max_cpus} CPUs",
             "Formats: FLAC, MP3, Ogg, Opus, WavPack, M4A/AAC, WMA",
             "",
         ]
-        for p in files[:300]:
+        total = len(to_process)
+        for i, p in enumerate(to_process, 1):
             try:
                 rel = p.relative_to(target)
             except ValueError:
                 rel = p
             lines.append(str(rel))
-        if len(files) > 300:
-            lines.append(f"... and {len(files) - 300} more")
+            if log_placeholder is not None and (i % 25 == 0 or i == total):
+                log_placeholder.code("\n".join(lines[-LOG_PREVIEW_LINES:]), language=None)
         return 0, "\n".join(lines)
 
-    cmd = ["rsgain", "easy", "-m", str(os.cpu_count() or 2)]
+    cmd = ["rsgain", "easy", "-m", str(worker_count)]
     if skip_existing:
         cmd.append("-S")
     cmd.append(str(target))
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    out = (result.stdout or "") + (("\n" + result.stderr) if result.stderr else "")
-    return result.returncode, out.strip()
+    # Stream output so the UI is not blank while rsgain runs
+    lines: list[str] = []
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line.rstrip("\n"))
+            if log_placeholder is not None:
+                log_placeholder.code("\n".join(lines[-LOG_PREVIEW_LINES:]), language=None)
+        code = proc.wait()
+    except Exception as e:
+        return 1, f"Failed to run rsgain: {e}"
+
+    return code, "\n".join(lines).strip()
 
 
-def make_log_download(logs: list[str], prefix: str):
+def make_log_download(logs: list[str], prefix: str, label: str = "📥 Download Log"):
+    """Single log download button (legacy helper)."""
     if not logs:
         return
     content = "\n".join(logs)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     st.download_button(
-        label="📥 Download Log",
+        label=label,
         data=content,
         file_name=f"flacarr_{prefix}_{timestamp}.log",
         mime="text/plain",
         key=f"dl_{prefix}_{timestamp}"
     )
+
+
+def offer_split_log_downloads(
+    complete: list[str],
+    action: list[str],
+    errors: list[str],
+    prefix: str,
+    dry_run: bool,
+    persist: bool = True,
+) -> None:
+    """
+    Offer separate download buttons + a ZIP.
+    Also stores artifacts in History and last_results (when persist=True).
+    """
+    if persist:
+        push_log_artifacts(prefix, dry_run, complete, action, errors)
+        store_last_results(prefix, complete, action, errors, dry_run)
+
+    # Stable keys from stored result so buttons survive until Clear results
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    complete_txt = "\n".join(complete) if complete else "(empty)"
+    action_txt = "\n".join(action) if action else "(none)"
+    errors_txt = "\n".join(errors) if errors else "(none)"
+
+    action_label = (
+        "📋 Files that would be touched"
+        if dry_run
+        else "📋 Files processed / deleted"
+    )
+
+    st.markdown("#### Download logs")
+    if dry_run:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.download_button(
+                label="📄 Complete log",
+                data=complete_txt,
+                file_name=f"flacarr_{prefix}_complete_{stamp}.log",
+                mime="text/plain",
+                key=f"dl_{prefix}_complete",
+            )
+        with c2:
+            st.download_button(
+                label=action_label,
+                data=action_txt,
+                file_name=f"flacarr_{prefix}_action_{stamp}.log",
+                mime="text/plain",
+                key=f"dl_{prefix}_action",
+            )
+        with c3:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"flacarr_{prefix}_complete_{stamp}.log", complete_txt)
+                zf.writestr(f"flacarr_{prefix}_action_{stamp}.log", action_txt)
+            st.download_button(
+                label="📦 ZIP (all logs)",
+                data=buf.getvalue(),
+                file_name=f"flacarr_{prefix}_logs_{stamp}.zip",
+                mime="application/zip",
+                key=f"dl_{prefix}_zip",
+            )
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.download_button(
+                label="📄 Complete log",
+                data=complete_txt,
+                file_name=f"flacarr_{prefix}_complete_{stamp}.log",
+                mime="text/plain",
+                key=f"dl_{prefix}_complete",
+            )
+        with c2:
+            st.download_button(
+                label=action_label,
+                data=action_txt,
+                file_name=f"flacarr_{prefix}_action_{stamp}.log",
+                mime="text/plain",
+                key=f"dl_{prefix}_action",
+            )
+        with c3:
+            st.download_button(
+                label="⚠ Error log only",
+                data=errors_txt,
+                file_name=f"flacarr_{prefix}_errors_{stamp}.log",
+                mime="text/plain",
+                key=f"dl_{prefix}_errors",
+            )
+        with c4:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(f"flacarr_{prefix}_complete_{stamp}.log", complete_txt)
+                zf.writestr(f"flacarr_{prefix}_action_{stamp}.log", action_txt)
+                zf.writestr(f"flacarr_{prefix}_errors_{stamp}.log", errors_txt)
+            st.download_button(
+                label="📦 ZIP (all logs)",
+                data=buf.getvalue(),
+                file_name=f"flacarr_{prefix}_logs_{stamp}.zip",
+                mime="application/zip",
+                key=f"dl_{prefix}_zip",
+            )
+
+
+def render_persisted_results(job_key: str) -> None:
+    """Show last run preview + downloads until user clears."""
+    data = st.session_state.last_results.get(job_key)
+    if not data:
+        return
+    st.markdown("---")
+    st.markdown("#### Last run results")
+    show_scrollable_log(data.get("complete") or [])
+    offer_split_log_downloads(
+        complete=data.get("complete") or [],
+        action=data.get("action") or [],
+        errors=data.get("errors") or [],
+        prefix=job_key,
+        dry_run=bool(data.get("dry_run")),
+        persist=False,
+    )
+    if st.button("Clear results", type="secondary", key=f"clear_res_{job_key}"):
+        st.session_state.last_results.pop(job_key, None)
+        st.rerun()
 
 
 def collect_encode_targets(folder: Path) -> list[Path]:
@@ -608,24 +911,49 @@ with st.sidebar:
     else:
         st.warning("Enter a valid library root")
 
+    st.markdown("---")
+    st.subheader("ReplayGain")
+    _cpu_max = os.cpu_count() or 2
+    gain_jobs = st.slider(
+        "Parallel jobs (cores)",
+        min_value=1,
+        max_value=_cpu_max,
+        value=_cpu_max,
+        step=1,
+        help=(
+            "Passed to rsgain as -m. Lower this on full-library runs if you want "
+            "to leave headroom for other containers (Navidrome, Lidarr, etc.)."
+        ),
+        key="gain_jobs_slider",
+    )
+    st.caption(f"Using **{gain_jobs}** of **{_cpu_max}** visible CPUs")
+
+    st.markdown("---")
+    st.markdown(
+        '[GitHub: homerjatmoes/Flacarr](https://github.com/homerjatmoes/Flacarr)',
+        unsafe_allow_html=False,
+    )
+    st.markdown(
+        '<p style="color:#888888;font-size:0.8rem;line-height:1.35;margin-top:0.5rem;">'
+        "This project takes no responsibility for file loss, data corruption, "
+        "or any other damage that may result from its use. "
+        "<strong>Use at your own risk.</strong> Always ensure you have a current "
+        "backup of your music library before proceeding."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
 
 # -------------------------------------------------
 # Tabs
 # -------------------------------------------------
-(
-    tab_full, tab_encode, tab_gain, tab_lrc, tab_empty,
-    tab_enc_hist, tab_gain_hist, tab_full_hist, tab_lrc_hist, tab_empty_hist
-) = st.tabs([
+tab_full, tab_encode, tab_gain, tab_lrc, tab_empty, tab_history = st.tabs([
     "Full Process",
     "Encode (Level 8)",
     "Gain",
     "LRC Cleanup",
     "Empty Folders",
-    "Encode History",
-    "Gain History",
-    "Full History",
-    "LRC History",
-    "Empty History",
+    "History",
 ])
 
 
@@ -637,11 +965,11 @@ with tab_full:
 
     1. **Encode** — FLAC → level 8; lossless WAV → FLAC level 8
     2. **Gain** — album + track ReplayGain tags via `rsgain` (tag-only)
-
-    Naming / multi-disc folders are handled by **Lidarr**.
-
-    **Use Dry Run the first time. When Dry Run is off, both steps modify files.**
     """)
+    st.markdown(
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, both steps modify files.</p>',
+        unsafe_allow_html=True,
+    )
 
     full_dry = st.checkbox(
         "Dry Run (preview only — no encodes or tags written)",
@@ -672,7 +1000,10 @@ with tab_full:
         if not folder or not folder.exists():
             st.error("Please choose a valid scope in the sidebar.")
         else:
-            combined_logs = []
+            combined_logs: list[str] = []
+            action_logs: list[str] = []
+            error_logs: list[str] = []
+
             combined_logs.append(f"=== FULL PROCESS  |  scope: {scope_label or folder}  |  dry={full_dry} ===")
             combined_logs.append("")
 
@@ -692,21 +1023,26 @@ with tab_full:
                         suffix = f.suffix.lower()
 
                         if suffix == ".flac" and full_skip_level8 and is_already_level8(f):
-                            combined_logs.append(f"↷ SKIPPED (already level 8): {rel}")
+                            line = f"↷ SKIPPED (already level 8): {rel}"
+                            combined_logs.append(line)
                             enc_skipped += 1
                         elif full_dry:
                             if suffix == ".flac":
-                                combined_logs.append(f"DRY  would encode FLAC: {rel}")
+                                line = f"DRY  would encode FLAC: {rel}"
+                                combined_logs.append(line)
+                                action_logs.append(line)
+                                enc_success += 1
                             else:
                                 lossless = is_lossless_wav(f)
                                 if lossless:
-                                    combined_logs.append(f"DRY  would convert WAV→FLAC: {rel}")
+                                    line = f"DRY  would convert WAV→FLAC: {rel}"
+                                    combined_logs.append(line)
+                                    action_logs.append(line)
+                                    enc_success += 1
                                 else:
-                                    combined_logs.append(f"DRY  skip WAV (not lossless PCM): {rel}")
+                                    line = f"DRY  skip WAV (not lossless PCM): {rel}"
+                                    combined_logs.append(line)
                                     enc_skipped += 1
-                                    log_placeholder.code("\n".join(combined_logs[-25:]), language=None)
-                                    continue
-                            enc_success += 1
                         else:
                             if suffix == ".flac":
                                 ok, msg = convert_to_level8(f)
@@ -714,39 +1050,60 @@ with tab_full:
                                 ok, msg = convert_wav_to_flac(f, delete_wav=full_delete_wav)
                             if ok:
                                 enc_success += 1
-                                combined_logs.append(f"✓ {rel}" + (f" — {msg}" if msg != "OK" else ""))
+                                line = f"✓ {rel}" + (f" — {msg}" if msg != "OK" else "")
+                                combined_logs.append(line)
+                                action_logs.append(line)
                             else:
                                 enc_failed += 1
-                                combined_logs.append(f"✗ {rel} → {msg}")
+                                line = f"✗ {rel} → {msg}"
+                                combined_logs.append(line)
+                                error_logs.append(line)
 
                         log_placeholder.code("\n".join(combined_logs[-25:]), language=None)
 
-            combined_logs.append(
+            enc_summary = (
                 f"Encode summary: {enc_success} ok • {enc_skipped} skipped • {enc_failed} failed (total {total})"
             )
+            combined_logs.append(enc_summary)
             combined_logs.append("")
 
-            # 2. GAIN
+            # 2. GAIN — full output in complete log; live preview while running
             combined_logs.append("--- 2. GAIN (ReplayGain) ---")
+            gain_placeholder = st.empty()
             with st.spinner("Running ReplayGain…"):
-                code, output = run_rsgain(folder, skip_existing=full_gain_skip, dry_run=full_dry)
+                code, output = run_rsgain(
+                    folder,
+                    skip_existing=full_gain_skip,
+                    dry_run=full_dry,
+                    log_placeholder=gain_placeholder,
+                    jobs=gain_jobs,
+                )
             gain_lines = output.splitlines() if output else []
             if gain_lines:
-                combined_logs.extend(gain_lines[:400])
-                if len(gain_lines) > 400:
-                    combined_logs.append(f"... ({len(gain_lines) - 400} more lines truncated)")
+                combined_logs.extend(gain_lines)
+                if full_dry:
+                    for gl in gain_lines:
+                        g = gl.strip()
+                        if not g:
+                            continue
+                        if g.startswith((
+                            "DRY", "[", "Mode:", "Skip", "Formats:", "===",
+                            "Already tagged",
+                        )):
+                            continue
+                        if "/" in g or g.endswith((
+                            ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".wav", ".wv", ".wma", ".aac"
+                        )):
+                            action_logs.append(f"GAIN would process: {g}")
             else:
                 combined_logs.append("(no rsgain output)")
             combined_logs.append(f"Gain exit code: {code}")
+            if code != 0:
+                error_logs.append(f"Gain exit code: {code}")
+                if gain_lines:
+                    error_logs.extend(gain_lines[-50:])
             combined_logs.append("")
             combined_logs.append("=== FULL PROCESS COMPLETE ===")
-
-            append_history("encode_history", [
-                f"(full) {ln}" for ln in combined_logs
-                if ln.startswith(("✓", "✗", "↷", "DRY")) or "Encode summary" in ln
-            ])
-            append_history("gain_history", [f"(full) {ln}" for ln in gain_lines] if gain_lines else ["(full) no gain output"])
-            append_history("full_history", combined_logs)
 
             if full_dry:
                 st.success("Dry Run finished — nothing was modified.")
@@ -755,8 +1112,12 @@ with tab_full:
                     f"Full Process finished — Encode: {enc_success} ok / {enc_skipped} skip / {enc_failed} fail  •  "
                     f"Gain exit {code}"
                 )
-            st.code("\n".join(combined_logs), language=None)
-            make_log_download(combined_logs, "full_process")
+
+            show_scrollable_log(combined_logs)
+            push_log_artifacts("full_process", full_dry, combined_logs, action_logs, error_logs)
+            store_last_results("full_process", combined_logs, action_logs, error_logs, full_dry)
+
+    render_persisted_results("full_process")
 
 
 # ========== ENCODE ==========
@@ -767,9 +1128,11 @@ with tab_encode:
     - **WAV** → if standard lossless PCM, convert to FLAC level 8
     - MP3 and other lossy formats are ignored
     - Strips non-standard ID3v2 tags from FLAC before encoding
-
-    **Use Dry Run the first time. When Dry Run is off, files will be modified.**
     """)
+    st.markdown(
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, files will be modified.</p>',
+        unsafe_allow_html=True,
+    )
 
     enc_dry = st.checkbox(
         "Dry Run (preview only — no files modified)",
@@ -802,7 +1165,9 @@ with tab_encode:
                 st.warning("No FLAC or WAV files found.")
             else:
                 log_placeholder = st.empty()
-                logs = []
+                logs: list[str] = []
+                action_logs: list[str] = []
+                error_logs: list[str] = []
                 success = skipped = failed = 0
 
                 with st.spinner(f"{'Previewing' if enc_dry else 'Encoding'} {total} files…"):
@@ -815,11 +1180,15 @@ with tab_encode:
                             skipped += 1
                         elif enc_dry:
                             if suffix == ".flac":
-                                logs.append(f"DRY  would encode FLAC: {rel}")
+                                line = f"DRY  would encode FLAC: {rel}"
+                                logs.append(line)
+                                action_logs.append(line)
                                 success += 1
                             else:
                                 if is_lossless_wav(f):
-                                    logs.append(f"DRY  would convert WAV→FLAC: {rel}")
+                                    line = f"DRY  would convert WAV→FLAC: {rel}"
+                                    logs.append(line)
+                                    action_logs.append(line)
                                     success += 1
                                 else:
                                     logs.append(f"↷ SKIPPED WAV (not lossless PCM): {rel}")
@@ -828,27 +1197,33 @@ with tab_encode:
                             ok, msg = convert_to_level8(f)
                             if ok:
                                 success += 1
-                                logs.append(f"✓ {rel}")
+                                line = f"✓ {rel}"
+                                logs.append(line)
+                                action_logs.append(line)
                             else:
                                 failed += 1
-                                logs.append(f"✗ {rel} → {msg}")
+                                line = f"✗ {rel} → {msg}"
+                                logs.append(line)
+                                error_logs.append(line)
                         else:
                             ok, msg = convert_wav_to_flac(f, delete_wav=delete_wav)
                             if ok:
                                 success += 1
-                                logs.append(f"✓ {rel} — {msg}")
+                                line = f"✓ {rel} — {msg}"
+                                logs.append(line)
+                                action_logs.append(line)
                             else:
                                 if "not a standard lossless" in msg or "already exists" in msg:
                                     skipped += 1
                                     logs.append(f"↷ SKIPPED: {rel} → {msg}")
                                 else:
                                     failed += 1
-                                    logs.append(f"✗ {rel} → {msg}")
+                                    line = f"✗ {rel} → {msg}"
+                                    logs.append(line)
+                                    error_logs.append(line)
 
                         log_placeholder.code("\n".join(logs[-30:]), language=None)
 
-                st.session_state.encode_logs = logs
-                append_history("encode_history", logs)
                 if enc_dry:
                     st.success(
                         f"Dry Run finished — **{success}** would convert • **{skipped}** skipped • "
@@ -859,7 +1234,11 @@ with tab_encode:
                         f"Done — **{success}** converted • **{skipped}** skipped • **{failed}** failed "
                         f"(total {total})"
                     )
-                make_log_download(logs, "encode")
+                show_scrollable_log(logs)
+                push_log_artifacts("encode", enc_dry, logs, action_logs, error_logs)
+                store_last_results("encode", logs, action_logs, error_logs, enc_dry)
+
+    render_persisted_results("encode")
 
 
 # ========== GAIN ==========
@@ -869,9 +1248,11 @@ with tab_gain:
     - **Tag-only** — audio stream is not modified
     - **Album + track** gain for every supported file
     - Formats: FLAC, MP3, Ogg, Opus, WavPack, M4A/AAC, WMA
-
-    **Use Dry Run the first time. When Dry Run is off, ReplayGain tags will be written.**
     """)
+    st.markdown(
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, ReplayGain tags will be written.</p>',
+        unsafe_allow_html=True,
+    )
 
     gain_skip = st.checkbox(
         "Skip files that already have ReplayGain tags",
@@ -884,25 +1265,55 @@ with tab_gain:
         key="gain_dry_run"
     )
 
-    if st.button("Start Gain Scan", type="primary", key="btn_gain"):
+    if st.button("Start Gain", type="primary", key="btn_gain"):
         if not folder or not folder.exists():
             st.error("Please choose a valid scope in the sidebar.")
         else:
-            with st.spinner("Running ReplayGain scan…"):
-                code, output = run_rsgain(folder, skip_existing=gain_skip, dry_run=gain_dry)
+            log_placeholder = st.empty()
+            with st.spinner("Running ReplayGain…"):
+                code, output = run_rsgain(
+                    folder,
+                    skip_existing=gain_skip,
+                    dry_run=gain_dry,
+                    log_placeholder=log_placeholder,
+                    jobs=gain_jobs,
+                )
 
             lines = output.splitlines() if output else []
-            prefix = "(dry-run) " if gain_dry else ""
-            append_history("gain_history", [prefix + ln for ln in lines] if lines else [prefix + "No output"])
+
+            action_logs: list[str] = []
+            error_logs: list[str] = []
+            if gain_dry:
+                for gl in lines:
+                    g = gl.strip()
+                    if not g:
+                        continue
+                    if g.startswith((
+                        "DRY", "[", "Mode:", "Skip", "Formats:", "===", "Already tagged",
+                    )):
+                        continue
+                    if "/" in g or g.endswith((
+                        ".flac", ".mp3", ".ogg", ".opus", ".m4a", ".wav", ".wv", ".wma", ".aac"
+                    )):
+                        action_logs.append(g)
+            if code != 0:
+                error_logs.append(f"Gain exit code: {code}")
+                error_logs.extend(lines[-50:] if lines else [])
 
             if code == 0:
-                st.success("Gain scan finished." + (" (dry run — nothing written)" if gain_dry else " Tags written."))
+                st.success(
+                    "Gain finished."
+                    + (" (dry run — nothing written)" if gain_dry else " Tags written.")
+                )
             else:
                 st.error(f"rsgain exited with code {code}")
 
-            if lines:
-                st.code("\n".join(lines[-200:]), language=None)
-                make_log_download(lines, "gain")
+            complete = lines if lines else ["(no rsgain output)"]
+            show_scrollable_log(complete)
+            push_log_artifacts("gain", gain_dry, complete, action_logs, error_logs)
+            store_last_results("gain", complete, action_logs, error_logs, gain_dry)
+
+    render_persisted_results("gain")
 
 
 # ========== LRC CLEANUP ==========
@@ -913,9 +1324,11 @@ with tab_lrc:
     (same base name). Typical after **Lidarr** renames change punctuation or case.
 
     Matching: exact stem, then case-insensitive stem, against common audio extensions.
-
-    **Use Dry Run the first time. When Dry Run is off, orphan `.lrc` files will be deleted.**
     """)
+    st.markdown(
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, orphan `.lrc` files will be deleted.</p>',
+        unsafe_allow_html=True,
+    )
 
     lrc_dry = st.checkbox(
         "Dry Run (list only — do not delete)",
@@ -938,12 +1351,15 @@ with tab_lrc:
             logs.append(f"Found **{len(orphans)}** orphan .lrc file(s)")
             logs.append("")
 
+            action_logs: list[str] = []
+            error_logs: list[str] = []
+
             if not orphans:
                 logs.append("Nothing to clean up.")
-                append_history("lrc_history", logs)
                 st.success("No orphan .lrc files found.")
-                st.code("\n".join(logs), language=None)
-                make_log_download(logs, "lrc_cleanup")
+                show_scrollable_log(logs)
+                push_log_artifacts("lrc_cleanup", lrc_dry, logs, action_logs, error_logs)
+                store_last_results("lrc_cleanup", logs, action_logs, error_logs, lrc_dry)
             else:
                 deleted = failed = 0
                 log_placeholder = st.empty()
@@ -954,10 +1370,11 @@ with tab_lrc:
                             rel = p.relative_to(folder)
                         except ValueError:
                             rel = p
-                        logs.append(f"DRY  would delete: {rel}")
+                        line = f"DRY  would delete: {rel}"
+                        logs.append(line)
+                        action_logs.append(line)
                     logs.append("")
                     logs.append(f"Dry Run summary: {len(orphans)} would be deleted. Nothing was modified.")
-                    append_history("lrc_history", logs)
                     st.success(f"Dry Run — **{len(orphans)}** orphan .lrc file(s) would be deleted.")
                 else:
                     for p in orphans:
@@ -968,18 +1385,24 @@ with tab_lrc:
                         try:
                             p.unlink()
                             deleted += 1
-                            logs.append(f"✓ deleted: {rel}")
+                            line = f"✓ deleted: {rel}"
+                            logs.append(line)
+                            action_logs.append(line)
                         except Exception as e:
                             failed += 1
-                            logs.append(f"✗ {rel} → {e}")
-                        log_placeholder.code("\n".join(logs[-40:]), language=None)
+                            line = f"✗ {rel} → {e}"
+                            logs.append(line)
+                            error_logs.append(line)
+                        log_placeholder.code("\n".join(logs[-LOG_PREVIEW_LINES:]), language=None)
                     logs.append("")
                     logs.append(f"Delete summary: {deleted} deleted • {failed} failed • {len(orphans)} total")
-                    append_history("lrc_history", logs)
                     st.success(f"Done — **{deleted}** deleted • **{failed}** failed.")
 
-                st.code("\n".join(logs), language=None)
-                make_log_download(logs, "lrc_cleanup")
+                show_scrollable_log(logs)
+                push_log_artifacts("lrc_cleanup", lrc_dry, logs, action_logs, error_logs)
+                store_last_results("lrc_cleanup", logs, action_logs, error_logs, lrc_dry)
+
+    render_persisted_results("lrc_cleanup")
 
 
 # ========== EMPTY FOLDERS ==========
@@ -992,8 +1415,12 @@ with tab_empty:
 
     Structure expected: `Artist / Album (Year) / …`
 
-    **Use Dry Run the first time. When Dry Run is off, selected folders are deleted recursively.**
+    **Ignored:** hidden folders (`.…`), `Artist Pictures`, `Podcasts`
     """)
+    st.markdown(
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, selected folders are deleted recursively.</p>',
+        unsafe_allow_html=True,
+    )
 
     empty_dry = st.checkbox(
         "Dry Run (list only — do not delete)",
@@ -1027,6 +1454,34 @@ with tab_empty:
                 (str(p), files) for p, files in found
             ]
             st.success(f"Found **{len(found)}** album folder(s) with no audio.")
+
+            # Always write a scan log (so downloads / History work even before delete)
+            scan_logs: list[str] = [
+                f"=== EMPTY FOLDERS SCAN  |  scope: {scope_label or folder} ===",
+                f"Found {len(found)} album folder(s) with no audio",
+                "Ignored: hidden folders, Artist Pictures, Podcasts",
+                "",
+            ]
+            scan_action: list[str] = []
+            for p, files in found:
+                try:
+                    rel = str(p.relative_to(root))
+                except Exception:
+                    rel = str(p)
+                n = len([f for f in files if f != "…"])
+                extra = "+" if "…" in files else ""
+                line = f"EMPTY: {rel}  ({n}{extra} leftover file(s))"
+                scan_logs.append(line)
+                scan_action.append(line)
+                for f in files[:15]:
+                    if f != "…":
+                        scan_logs.append(f"       · {f}")
+                if len(files) > 15:
+                    scan_logs.append("       · …")
+            if not found:
+                scan_logs.append("Nothing to clean up.")
+            push_log_artifacts("empty_folders", True, scan_logs, scan_action, [])
+            store_last_results("empty_folders", scan_logs, scan_action, [], True)
 
     results = st.session_state.empty_scan_results
     if results:
@@ -1081,6 +1536,8 @@ with tab_empty:
                 logs.append("")
 
                 removed = failed = 0
+                action_logs: list[str] = []
+                error_logs: list[str] = []
                 log_placeholder = st.empty()
 
                 for label in selected:
@@ -1094,7 +1551,9 @@ with tab_empty:
                     files = next((f for ps, f in results if ps == path_str), [])
 
                     if empty_dry:
-                        logs.append(f"DRY  would delete folder: {rel}")
+                        line = f"DRY  would delete folder: {rel}"
+                        logs.append(line)
+                        action_logs.append(line)
                         for f in files[:20]:
                             logs.append(f"       · {f}")
                         if len(files) > 20:
@@ -1105,10 +1564,14 @@ with tab_empty:
                             if p.exists():
                                 shutil.rmtree(p)
                             removed += 1
-                            logs.append(f"✓ deleted folder: {rel}")
+                            line = f"✓ deleted folder: {rel}"
+                            logs.append(line)
+                            action_logs.append(line)
                         except Exception as e:
                             failed += 1
-                            logs.append(f"✗ {rel} → {e}")
+                            line = f"✗ {rel} → {e}"
+                            logs.append(line)
+                            error_logs.append(line)
                     log_placeholder.code("\n".join(logs[-40:]), language=None)
 
                 logs.append("")
@@ -1118,81 +1581,110 @@ with tab_empty:
                 else:
                     logs.append(f"Delete summary: {removed} deleted • {failed} failed")
                     st.success(f"Done — **{removed}** deleted • **{failed}** failed.")
-                    # Drop removed paths from scan results
                     gone = {label_to_path[l] for l in selected}
                     st.session_state.empty_scan_results = [
                         (ps, f) for ps, f in results if ps not in gone
                     ]
 
-                append_history("empty_history", logs)
-                st.code("\n".join(logs), language=None)
-                make_log_download(logs, "empty_folders")
+                show_scrollable_log(logs)
+                push_log_artifacts("empty_folders", empty_dry, logs, action_logs, error_logs)
+                store_last_results("empty_folders", logs, action_logs, error_logs, empty_dry)
     else:
         st.caption("Click **Scan for Empty Albums** to search the current scope.")
 
+    render_persisted_results("empty_folders")
 
-# ========== HISTORIES ==========
-with tab_enc_hist:
-    st.subheader("Encode History")
-    hist = st.session_state.encode_history
-    if not hist:
-        st.info("No encode history yet.")
+
+# ========== HISTORY ==========
+with tab_history:
+    st.subheader("Log history")
+    st.markdown(
+        f"Keeps the last **{ARTIFACTS_PER_TYPE}** of each type: "
+        "`complete` · `action` · `errors` · `dry_run`."
+    )
+
+    arts = st.session_state.log_artifacts
+    if not arts:
+        st.info("No saved logs yet. Run a job to generate downloadable history.")
     else:
-        st.caption(f"Showing last **{len(hist)}** of up to {HISTORY_LIMIT} entries (newest first)")
-        st.code("\n".join(hist), language=None)
-        make_log_download(hist, "encode_history")
-        if st.button("Clear Encode History", type="secondary", key="clear_enc_hist"):
-            st.session_state.encode_history = []
+        # counts by type
+        counts: dict[str, int] = {}
+        for a in arts:
+            counts[a["type"]] = counts.get(a["type"], 0) + 1
+        st.caption(
+            " · ".join(f"**{t}**: {n}" for t, n in sorted(counts.items()))
+        )
+
+        selected_ids: list[str] = []
+        for a in arts:
+            label = (
+                f"[{a['ts']}]  {a['job']}  ·  {a['type']}"
+                f"{'  ·  dry' if a.get('dry_run') else ''}"
+                f"  ·  {a.get('line_count', '?')} lines"
+            )
+            if st.checkbox(label, key=f"hist_cb_{a['id']}"):
+                selected_ids.append(a["id"])
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            dl_clicked = st.button(
+                "Download Selected",
+                type="primary",
+                key="hist_dl_selected",
+                disabled=not selected_ids,
+            )
+        with c2:
+            clr_sel = st.button(
+                "Clear Selected",
+                type="secondary",
+                key="hist_clr_selected",
+                disabled=not selected_ids,
+            )
+        with c3:
+            clr_all = st.button(
+                "Clear All History",
+                type="secondary",
+                key="hist_clr_all",
+            )
+
+        if dl_clicked and selected_ids:
+            chosen = [a for a in arts if a["id"] in selected_ids]
+            buf = io.BytesIO()
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for a in chosen:
+                    name = (
+                        f"flacarr_{a['job']}_{a['type']}_"
+                        f"{a['ts'].replace(':', '').replace(' ', '_')}.log"
+                    )
+                    zf.writestr(name, a.get("content") or "(empty)")
+            st.download_button(
+                label="📦 Save ZIP of selected logs",
+                data=buf.getvalue(),
+                file_name=f"flacarr_history_{stamp}.zip",
+                mime="application/zip",
+                key=f"hist_zip_{stamp}",
+                type="primary",
+            )
+
+        if clr_sel and selected_ids:
+            st.session_state.log_artifacts = [
+                a for a in arts if a["id"] not in selected_ids
+            ]
             st.rerun()
 
-with tab_gain_hist:
-    st.subheader("Gain History")
-    hist = st.session_state.gain_history
-    if not hist:
-        st.info("No gain history yet.")
-    else:
-        st.caption(f"Showing last **{len(hist)}** of up to {HISTORY_LIMIT} entries (newest first)")
-        st.code("\n".join(hist), language=None)
-        make_log_download(hist, "gain_history")
-        if st.button("Clear Gain History", type="secondary", key="clear_gain_hist"):
-            st.session_state.gain_history = []
-            st.rerun()
+        if clr_all:
+            st.session_state.hist_clear_confirm = True
 
-with tab_full_hist:
-    st.subheader("Full Process History")
-    hist = st.session_state.full_history
-    if not hist:
-        st.info("No full-process history yet.")
-    else:
-        st.caption(f"Showing last **{len(hist)}** of up to {HISTORY_LIMIT} entries (newest first)")
-        st.code("\n".join(hist), language=None)
-        make_log_download(hist, "full_history")
-        if st.button("Clear Full History", type="secondary", key="clear_full_hist"):
-            st.session_state.full_history = []
-            st.rerun()
-
-with tab_lrc_hist:
-    st.subheader("LRC Cleanup History")
-    hist = st.session_state.lrc_history
-    if not hist:
-        st.info("No LRC cleanup history yet.")
-    else:
-        st.caption(f"Showing last **{len(hist)}** of up to {HISTORY_LIMIT} entries (newest first)")
-        st.code("\n".join(hist), language=None)
-        make_log_download(hist, "lrc_history")
-        if st.button("Clear LRC History", type="secondary", key="clear_lrc_hist"):
-            st.session_state.lrc_history = []
-            st.rerun()
-
-with tab_empty_hist:
-    st.subheader("Empty Folders History")
-    hist = st.session_state.empty_history
-    if not hist:
-        st.info("No empty-folder history yet.")
-    else:
-        st.caption(f"Showing last **{len(hist)}** of up to {HISTORY_LIMIT} entries (newest first)")
-        st.code("\n".join(hist), language=None)
-        make_log_download(hist, "empty_history")
-        if st.button("Clear Empty History", type="secondary", key="clear_empty_hist"):
-            st.session_state.empty_history = []
-            st.rerun()
+        if st.session_state.hist_clear_confirm:
+            st.warning("This will permanently clear **all** saved log history in this session.")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("Yes — clear all history", type="secondary", key="hist_clr_yes"):
+                    st.session_state.log_artifacts = []
+                    st.session_state.hist_clear_confirm = False
+                    st.rerun()
+            with cc2:
+                if st.button("Cancel", type="primary", key="hist_clr_no"):
+                    st.session_state.hist_clear_confirm = False
+                    st.rerun()

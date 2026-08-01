@@ -1,122 +1,260 @@
 # Flacarr
 
-Web-based toolkit for maintaining a FLAC (and mixed-format) music library.  
-Runs as a Streamlit app on port **10069**, designed for Unraid via Docker Compose.
+Web-based toolkit for maintaining a music library.  
+Runs as a Streamlit app on port **10069**, designed for Docker (including Unraid Compose).
+
+**Lidarr** owns naming and multi-disc folder structure.  
+**Flacarr** owns encode (level 8), ReplayGain, orphan `.lrc` cleanup, and empty-folder cleanup.
+
+Flacarr is AI coded with human review.
 
 ---
 
-## Features
+## What it does
 
-### Scope (sidebar)
+| Tab | Purpose |
+|-----|---------|
+| **Full Process** | One pass: **Encode → Gain** on the selected scope |
+| **Encode (Level 8)** | FLAC → level 8; lossless WAV → FLAC level 8 |
+| **Gain** | Album + track ReplayGain tags (tag-only) via `rsgain` |
+| **LRC Cleanup** | Find/delete orphan `.lrc` files with no matching audio |
+| **Empty Folders** | Album folders with no audio (leftover `.lrc`/`.jpg`/`.txt`) |
+| **History** | Saved log artifacts (complete / action / errors / dry_run) |
+
+---
+
+## Scope (sidebar)
+
 Limit every job to:
+
 - **Entire library**
-- **One artist** (dropdown of folders under the library root)
+- **One artist** (dropdown)
 - **One album** (artist → album)
-- Or type a **relative path** manually (e.g. `Rolling Stones, The` or `Artist/Album (Year)`)
+- Or type a **relative path** (e.g. `Rolling Stones, The`)
 
-Library root is the path **inside the container** (typically `/mnt/user/Media/Music`).
+**Library root** is the path *inside the container* (usually `/mnt/user/Media/Music` on Unraid, or your bind-mounted path).
 
----
+The sidebar shows FLAC and WAV counts for the current scope.
 
-### Full Process (new)
-One-button pipeline that runs the three steps in order on the selected scope:
+### ReplayGain parallel jobs
 
-1. **Encode** → level 8
-2. **Rename / Organize** → multi-disc CD folders
-3. **Gain** → album + track ReplayGain
+Sidebar control: **Parallel jobs (cores)** (slider, 1 → all visible CPUs).
 
-- **Dry Run** mode (default) previews every step without writing anything
-- When Dry Run is off, all three steps modify files in a single pass
-- Combined log + download; entries also appear in the individual history tabs (prefixed `(full)`)
-- Uses the same sidebar scope and “Skip already level 8” option
+- Passed to `rsgain` as `-m`
+- Default: all CPUs the container can see
+- Lower this on full-library runs to leave headroom for other services (Navidrome, Lidarr, etc.)
 
 ---
 
-### Encode (Level 8)
-- Re-encode **FLAC only** to compression level 8 (in-place, recursive)
-- Lossless; preserves bit depth (16-bit and 24-bit stay as they are)
-- Ignores MP3 and other non-FLAC files
-- Strips non-standard **ID3v2** tags on FLAC before encoding (keeps Vorbis tags and embedded art)
-- Option: **Skip files already marked as level 8** (writes a `flacarr_level=8` tag after success)
-- Spinner progress and downloadable log
+## Full Process
+
+Runs in order:
+
+1. **Encode** — FLAC re-encode to level 8; lossless WAV → FLAC level 8  
+2. **Gain** — album + track ReplayGain (`rsgain easy`)
+
+Options:
+
+- **Dry Run** — preview only; nothing written  
+- **Skip files already marked as level 8**  
+- **Skip files that already have ReplayGain tags**  
+- **Delete WAV after successful FLAC conversion**
 
 ---
 
-### Rename / Organize
-- **Preserves Lidarr-style names** — does not rebuild Artist / Album / title from tags
-- Only adjusts the **`CD xx` folder** level:
-  - **Single-disc** → no `CD xx` folder (removes one if present)
-  - **Multi-disc** → ensures tracks sit under `CD 01`, `CD 02`, …
-- Uses discnumber / totaldiscs tags only for that decision
-- **Dry Run** preview before moving files
-- Confirm step before applying moves
-- Downloadable log
+## Encode (Level 8)
+
+- **FLAC** — re-encode **in-place** to compression level 8 (lossless; 16-bit and 24-bit preserved)  
+- **WAV** — if standard **uncompressed PCM** (lossless), convert to FLAC level 8  
+- Non-PCM / unusual WAV containers are **skipped**  
+- **MP3 and other lossy formats are ignored**  
+- Non-standard **ID3v2** tags are stripped from FLAC before encoding (Vorbis tags and art kept)  
+- After success, writes tag `flacarr_level=8` for later skips  
+
+Options:
+
+- **Dry Run** — preview only; nothing written  
+- Skip files already marked as level 8  
+- Delete WAV after successful conversion  
 
 ---
 
-### Gain (ReplayGain)
-- **Tag-only** — audio stream is never modified
-- Always writes **album + track** ReplayGain
-- Powered by **rsgain** (`rsgain easy`)
-- Formats: **FLAC, MP3, Ogg, Opus, WavPack, M4A/AAC, WMA** (whatever rsgain supports)
-- Options:
-  - **Skip files that already have ReplayGain tags** (`-S`)
-  - **Dry Run** (list files that would be processed; write nothing)
-- Uses the same scope as Encode / Rename / Full Process
+## Gain (ReplayGain)
+
+- **Tag-only** — audio data is never modified  
+- Always computes **album + track** gain  
+- Engine: **rsgain**  
+- Formats: FLAC, MP3, Ogg, Opus, WavPack, M4A/AAC, WMA  
+- Live log stream while running  
+- Parallelism controlled from the sidebar (see above)  
+
+Options:
+
+- **Dry Run** — list files that would be processed (honors skip-existing by checking tags)  
+- Skip files that already have ReplayGain / R128 tags  
 
 ---
 
-### History tabs
-| Tab | Contents |
-|-----|----------|
-| **Encode History** | Last 300 encode results (newest first) |
-| **Rename History** | Last 300 rename / dry-run results |
-| **Gain History** | Last 300 gain / dry-run results |
-| **Full History** | Last 300 full-process combined logs |
+## LRC Cleanup
 
-Each history tab supports **Download Log** and **Clear History**.
+After **Lidarr** renames (punctuation, letter case, etc.), sidecar `.lrc` files from LRCGET may no longer match the audio name.
 
-History is kept in the **browser session** (cleared on refresh or container restart unless downloaded).
+- Scans the selected scope for `.lrc` files with **no matching audio** in the same folder  
+- Match: same stem (exact, then case-insensitive) against common audio extensions  
+- **Dry Run** (default) lists orphans only  
+- With Dry Run off, orphans are **deleted**  
 
----
-
-### UI
-- Dark theme only (no light mode)
-- Streamlit chrome / theme picker hidden
-- Green primary actions (Start Full Process, Start Encoding, Start Rename, Start Gain Scan, Confirm)
-- Red Clear History buttons
-- Green selected-tab highlight
-- Left-aligned compact logo (`flacarr.jpg` in the app folder)
+Does **not** rename `.lrc` files to match new audio names — only removes true orphans.
 
 ---
 
-## Requirements (Docker image)
-- `flac` — level 8 re-encode
-- `rsgain` — ReplayGain tagging
-- Python packages: `streamlit`, `mutagen`
+## Empty Folders
+
+Lidarr only removes **completely empty** directories. Album folders that still hold `.lrc`, `.jpg`, `.txt`, etc. (but **no audio**) are left behind.
+
+- Scans for **album folders** (`Artist / Album`) with **no audio** in the subtree  
+- Lists leftover file names for each  
+- **Multiselect** which folders to remove  
+- **Dry Run** (default) previews only  
+- With Dry Run off, selected folders are deleted recursively  
+- **Scan** and **Remove** both write downloadable logs (History + Last run results)  
+
+### Ignored paths
+
+These are never treated as artists/albums:
+
+- **Hidden folders** (names starting with `.`, e.g. `.whipper_logs`)  
+- **`Artist Pictures`**  
+- **`Podcasts`**  
+
+(case-insensitive)
 
 ---
 
-## Run with Docker Compose (Unraid)
+## Logs and downloads
 
-1. Copy the `Flacarr` folder to the server, e.g. `/mnt/user/appdata/flacarr`.
+After every job:
 
-2. Ensure these files are present:
-   ```text
-   docker-compose.yml
-   Dockerfile
-   Flacarr.py
-   flacarr.jpg          # app header logo
-   Flacarr.png          # Unraid container icon
-   requirements.txt
+- **Preview** is limited to the last **100 lines** (scrollable)  
+- Full output is available as downloads  
+- Downloads stay on the tab until **Clear results**  
+
+### Download sets
+
+**Dry Run**
+
+| File | Contents |
+|------|----------|
+| **Complete log** | Full run (headers, skips, summaries) |
+| **Files that would be touched** | Only items that would be encoded / tagged / deleted |
+| **ZIP** | Both files |
+
+**Process run**
+
+| File | Contents |
+|------|----------|
+| **Complete log** | Full run |
+| **Files processed / deleted** | Successful actions only |
+| **Error log only** | Failures only |
+| **ZIP** | All three |
+
+---
+
+## History
+
+Single **History** tab (session-only):
+
+- Keeps the last **20** of each type: `complete` · `action` · `errors` · `dry_run`  
+- Checkbox per artifact  
+- **Download Selected** → ZIP of chosen logs  
+- **Clear Selected**  
+- **Clear All History** with confirmation  
+
+Cleared on browser refresh / container restart unless you downloaded the files.
+
+---
+
+## Files in this project
+
+```text
+Flacarr.py           # main app
+Dockerfile           # flac + rsgain + Python deps
+docker-compose.yml   # Docker / Unraid stack
+requirements.txt     # streamlit, mutagen
+flacarr.jpg          # in-app logo
+Flacarr.png          # optional container icon
+README.md
+```
+
+---
+
+## Docker (standard)
+
+Requirements: Docker Engine and Docker Compose v2.
+
+1. Clone or copy this repository:
+
+   ```bash
+   git clone https://github.com/homerjatmoes/Flacarr.git
+   cd Flacarr
    ```
 
-3. Edit `docker-compose.yml` if needed:
-   - Music library volume (left side = host path)
-   - `media` network (must already exist)
-   - Icon path: `net.unraid.docker.icon`
+2. Edit `docker-compose.yml`:
+   - Map your music library on the left side of the volume
+   - Adjust port if `10069` is already in use
+   - Remove or change the external `media` network if you are not on Unraid
+
+   Minimal example:
+
+   ```yaml
+   services:
+     flacarr:
+       build: .
+       container_name: flacarr
+       ports:
+         - "10069:10069"
+       volumes:
+         - /path/to/your/Music:/mnt/user/Media/Music
+       restart: unless-stopped
+   ```
+
+3. Build and start:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+4. Open the app:
+
+   ```text
+   http://localhost:10069
+   ```
+   or `http://YOUR-SERVER-IP:10069` from another machine.
+
+### Useful commands
+
+```bash
+docker compose logs -f
+docker compose down
+docker compose up -d --build
+docker compose up -d --force-recreate
+```
+
+Set the **Library root** in the sidebar to the path *inside* the container (the right-hand side of the volume mount, e.g. `/mnt/user/Media/Music`).
+
+---
+
+## Docker on Unraid
+
+1. Copy this folder to e.g. `/mnt/user/appdata/flacarr`.
+
+2. Edit `docker-compose.yml` if needed:
+   - Music volume (host path on the left)
+   - External network `media` (must already exist)
+   - Icon path for Unraid
 
    Example:
+
    ```yaml
    services:
      flacarr:
@@ -138,32 +276,26 @@ History is kept in the **browser session** (cleared on refresh or container rest
        external: true
    ```
 
-4. Start:
+3. Start:
+
    ```bash
    cd /mnt/user/appdata/flacarr
    docker compose up -d --build
    ```
 
-   Or use **Compose Manager Plus**: Add Stack → Indirect Path → `/mnt/user/appdata/flacarr` → Compose Up.
+   Or use **Compose Manager Plus** with Indirect Path → `/mnt/user/appdata/flacarr`.
 
-5. Open:
+4. Open:
+
    ```text
    http://YOUR-UNRAID-IP:10069
    ```
-
-### Useful commands
-```bash
-docker compose logs -f          # follow logs
-docker compose down             # stop
-docker compose up -d --build    # rebuild after code changes
-docker compose up -d --force-recreate   # recreate (e.g. after label/icon changes)
-```
 
 ---
 
 ## Local run (without Docker)
 
-Install system tools (`flac`, `rsgain`) yourself, then:
+Install `flac` and `rsgain` on the host, then:
 
 ```bash
 pip install -r requirements.txt
@@ -177,42 +309,20 @@ streamlit run Flacarr.py \
 
 ---
 
-## Recommended Linux Workflow
+## Notes
 
-Designed for a Lidarr + Navidrome library on Unraid / CachyOS (or any Linux host).  
-All rips end as **FLAC compression level 8** with album + track ReplayGain.
-
-1. **Whipper** – accurate CD rip  
-   - Output: FLAC at compression level 5 (fast rip; level 8 is deferred)  
-   - Uses MusicBrainz for initial metadata  
-   - Place the resulting album folder into the Lidarr-watched music root (or a holding area)
-
-2. **Flacarr** (this app – GUI on port 10069)  
-   - Preferred: open the **Full Process** tab → Dry Run first, then run for real  
-     (automatically chains Encode → Rename / Organize → Gain)  
-   - Or run the three tabs individually:  
-     1. **Encode** → re-encode every FLAC to level 8 (lossless, in-place; skip already-marked files)  
-     2. **Rename / Organize** → dry-run first, then apply: ensure multi-disc albums use `CD 01` / `CD 02` folders and single-disc albums have none (preserves Lidarr-style folder names)  
-     3. **Gain** → write album + track ReplayGain tags via `rsgain` (tag-only; optional skip if tags already present)
-
-3. **Lidarr**  
-   - Check / import the album  
-   - Run its own rename if desired (Flacarr’s rename is deliberately minimal so Lidarr remains the source of truth for artist/album naming)
-
-4. **MusicBrainz Picard**  
-   - Final metadata polish + embedded album art  
-   - Picard is fully compatible with the files after Whipper + Flacarr (Vorbis comments preserved; non-standard ID3v2 tags already stripped by Encode)
-
-**Result:** Navidrome-ready library with consistent level-8 FLACs, proper multi-disc layout, ReplayGain, and clean tags/art.
-
-> Tip: Always start with **Dry Run** (especially the Full Process tab) the first time you process a large artist or the entire library.
+- WAV lossless detection uses Python’s `wave` module (standard PCM WAV only).  
+- Re-encoding FLAC level 8 → level 8 is safe and lossless.  
+- Prefer **Dry Run** the first time you use any job on a large scope.  
+- Gain dry run with “skip existing” checks tags on each file (can take a few minutes on a full library).  
+- For multi-disc folder layout, use **Lidarr**, not Flacarr.  
+- History and “last results” are session-based; download logs you want to keep.  
+- Hide maintenance folders with a leading `.` so Empty Folders and scans ignore them.  
 
 ---
 
-## Notes
+## Disclaimer
 
-- **Encode** is lossless. Re-encoding level 8 → level 8 is safe.
-- After a successful encode, Flacarr stores `flacarr_level=8` so skips can work on later runs.
-- **Rename** is intentionally conservative so Lidarr naming (`Rolling Stones, The`, title case, years) is not overwritten from tags.
-- **Gain** depends on album-per-folder layout (normal for Lidarr libraries).
-- Always prefer **Dry Run** the first time you use Rename or Gain on a large scope.
+This project takes **no responsibility** for file loss, data corruption, or any other damage that may result from its use.  
+
+**Use at your own risk.** Always ensure you have a current backup of your music library before running encode, gain, cleanup, or any other operation that modifies or deletes files.
