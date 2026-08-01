@@ -14,7 +14,7 @@ Flacarr is AI coded with human review.
 
 | Tab | Purpose |
 |-----|---------|
-| **Full Process** | One pass: **Encode → Gain** on the selected scope |
+| **Full Process** | One pass: **Encode → Gain** (+ optional Text Tags cleanup) |
 | **Encode (Level 8)** | FLAC → level 8; lossless WAV → FLAC level 8 |
 | **Gain** | Album + track ReplayGain tags (tag-only) via `rsgain` |
 | **LRC Cleanup** | Find/delete orphan `.lrc` files with no matching audio |
@@ -52,14 +52,16 @@ Sidebar control: **Parallel jobs (cores)** (slider, 1 → all visible CPUs).
 Runs in order:
 
 1. **Encode** — FLAC re-encode to level 8; lossless WAV → FLAC level 8  
-2. **Gain** — album + track ReplayGain (`rsgain easy`)
+2. **Gain** — album + track ReplayGain (`rsgain easy`)  
+3. **Text Tags** *(optional checkbox)* — remove Description / Comment / Notes  
 
 Options:
 
 - **Dry Run** — preview only; nothing written  
 - **Skip files already marked as level 8**  
 - **Skip files that already have ReplayGain tags**  
-- **Delete WAV after successful FLAC conversion**
+- **Delete WAV after successful FLAC conversion**  
+- **Remove Description / Comment / Notes tags** (default on)  
 
 ---
 
