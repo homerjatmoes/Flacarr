@@ -4,7 +4,7 @@ Web-based toolkit for maintaining a music library.
 Runs as a Streamlit app on port **10069**, designed for Docker (including Unraid Compose).
 
 **Lidarr** owns naming and multi-disc folder structure.  
-**Flacarr** owns encode (level 8), ReplayGain, orphan `.lrc` cleanup, and empty-folder cleanup.
+**Flacarr** owns encode (level 8), ReplayGain, orphan `.lrc` cleanup, empty-folder cleanup, and free-text tag removal (Description / Comment / Notes).
 
 Flacarr is AI coded with human review.
 
@@ -19,6 +19,7 @@ Flacarr is AI coded with human review.
 | **Gain** | Album + track ReplayGain tags (tag-only) via `rsgain` |
 | **LRC Cleanup** | Find/delete orphan `.lrc` files with no matching audio |
 | **Empty Folders** | Album folders with no audio (leftover `.lrc`/`.jpg`/`.txt`) |
+| **Text Tags** | Remove Description / Comment / Notes tags (tag-only) |
 | **History** | Saved log artifacts (complete / action / errors / dry_run) |
 
 ---
@@ -128,6 +129,21 @@ These are never treated as artists/albums:
 - **`Podcasts`**  
 
 (case-insensitive)
+
+---
+
+## Text Tags
+
+Removes free-text tags that are not used in this workflow:
+
+- **Description** (`DESCRIPTION`)
+- **Comment** (`COMMENT`, and ID3 `COMM` on MP3)
+- **Notes** (`NOTES` / `NOTE`)
+
+- **Tag-only** — audio stream is never modified  
+- Formats: FLAC, MP3, Ogg, Opus, WavPack, M4A/AAC, WMA  
+- **Dry Run** (default) lists files that have any of these tags  
+- With Dry Run off, matching tags are removed and the file is saved  
 
 ---
 

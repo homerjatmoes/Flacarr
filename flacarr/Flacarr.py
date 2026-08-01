@@ -438,6 +438,126 @@ LRC_AUDIO_EXTENSIONS = {
     ".wav", ".aiff", ".aif", ".ape", ".alac"
 }
 
+# Formats scanned for Description tags
+DESC_EXTENSIONS = {
+    ".flac", ".mp3", ".ogg", ".oga", ".opus", ".wv", ".m4a", ".aac", ".wma"
+}
+
+
+def _iter_tag_containers(audio):
+    """Yield mutable tag mapping objects from a mutagen file."""
+    if audio is None:
+        return
+    # FLAC / VorbisComment style (audio itself is dict-like)
+    if hasattr(audio, "keys") and hasattr(audio, "__delitem__"):
+        try:
+            list(audio.keys())
+            yield audio
+        except Exception:
+            pass
+    tags = getattr(audio, "tags", None)
+    if tags is not None and tags is not audio:
+        if hasattr(tags, "keys") and hasattr(tags, "__delitem__"):
+            yield tags
+
+
+# Free-text tags the user does not use (Vorbis / common names)
+TEXT_TAG_NAMES = {"DESCRIPTION", "COMMENT", "NOTES", "NOTE"}
+
+
+def _is_text_tag_key(key_str: str) -> bool:
+    """Match DESCRIPTION / COMMENT / NOTES / NOTE, and ID3 COMM frames."""
+    u = key_str.upper()
+    if u in TEXT_TAG_NAMES:
+        return True
+    # ID3 comment frames: COMM, COMM::eng, etc.
+    if u == "COMM" or u.startswith("COMM:"):
+        return True
+    return False
+
+
+def _tag_value_preview(container, key) -> str:
+    try:
+        val = container.get(key)
+        if isinstance(val, list) and val:
+            return str(val[0])[:120]
+        if val is not None:
+            return str(val)[:120]
+    except Exception:
+        pass
+    return ""
+
+
+def find_text_tag_entries(file_path: Path) -> list[tuple[str, str]]:
+    """
+    Return list of (key, value_preview) for Description / Comment / Notes tags.
+    """
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        audio = MutagenFile(file_path, easy=False)
+        if audio is None:
+            return found
+        for container in _iter_tag_containers(audio):
+            for key in list(container.keys()):
+                key_str = str(key)
+                if not _is_text_tag_key(key_str):
+                    continue
+                if key_str in seen:
+                    continue
+                seen.add(key_str)
+                found.append((key_str, _tag_value_preview(container, key)))
+    except Exception:
+        pass
+    return found
+
+
+def remove_text_tags(file_path: Path) -> tuple[bool, str, list[str]]:
+    """
+    Remove Description / Comment / Notes tags (tag-only; audio stream untouched).
+    Returns (ok, message, list of removed keys).
+    """
+    try:
+        audio = MutagenFile(file_path, easy=False)
+        if audio is None:
+            return False, "unsupported or unreadable", []
+
+        removed: list[str] = []
+        for container in _iter_tag_containers(audio):
+            for key in list(container.keys()):
+                key_str = str(key)
+                if _is_text_tag_key(key_str):
+                    try:
+                        del container[key]
+                        removed.append(key_str)
+                    except Exception:
+                        pass
+
+        if not removed:
+            return True, "no text tags", []
+
+        audio.save()
+        # de-dupe while preserving order
+        uniq: list[str] = []
+        for k in removed:
+            if k not in uniq:
+                uniq.append(k)
+        return True, f"removed {', '.join(uniq)}", uniq
+    except Exception as e:
+        return False, str(e), []
+
+
+def collect_files_with_text_tags(folder: Path) -> list[tuple[Path, list[tuple[str, str]]]]:
+    """Scan folder for audio files that have Description / Comment / Notes tags."""
+    hits: list[tuple[Path, list[tuple[str, str]]]] = []
+    for p in folder.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in DESC_EXTENSIONS:
+            continue
+        entries = find_text_tag_entries(p)
+        if entries:
+            hits.append((p, entries))
+    return hits
+
 
 def find_orphan_lrcs(folder: Path) -> list[Path]:
     """
@@ -947,12 +1067,13 @@ with st.sidebar:
 # -------------------------------------------------
 # Tabs
 # -------------------------------------------------
-tab_full, tab_encode, tab_gain, tab_lrc, tab_empty, tab_history = st.tabs([
+tab_full, tab_encode, tab_gain, tab_lrc, tab_empty, tab_desc, tab_history = st.tabs([
     "Full Process",
     "Encode (Level 8)",
     "Gain",
     "LRC Cleanup",
     "Empty Folders",
+    "Text Tags",
     "History",
 ])
 
@@ -1593,6 +1714,114 @@ with tab_empty:
         st.caption("Click **Scan for Empty Albums** to search the current scope.")
 
     render_persisted_results("empty_folders")
+
+
+# ========== TEXT TAG REMOVAL (Description / Comment / Notes) ==========
+with tab_desc:
+    st.subheader("Remove Description, Comment & Notes")
+    st.markdown("""
+    Removes free-text tags you do not use:
+
+    - **Description** (`DESCRIPTION`)
+    - **Comment** (`COMMENT`, and ID3 `COMM` on MP3)
+    - **Notes** (`NOTES` / `NOTE`)
+
+    Tag-only — the audio stream is never modified.
+
+    Formats: FLAC, MP3, Ogg, Opus, WavPack, M4A/AAC, WMA
+    """)
+    st.markdown(
+        '<p class="flacarr-dryrun-note">Use Dry Run the first time. When Dry Run is off, these tags will be removed.</p>',
+        unsafe_allow_html=True,
+    )
+
+    desc_dry = st.checkbox(
+        "Dry Run (list only — do not modify tags)",
+        value=True,
+        key="desc_dry_run",
+    )
+
+    if not desc_dry:
+        st.warning(
+            "⚠️ Dry Run is **off**. Description, Comment, and Notes tags will be **removed**."
+        )
+
+    if st.button("Start Text Tag Cleanup", type="primary", key="btn_desc"):
+        if not folder or not folder.exists():
+            st.error("Please choose a valid scope in the sidebar.")
+        else:
+            with st.spinner("Scanning for Description / Comment / Notes tags…"):
+                hits = collect_files_with_text_tags(folder)
+
+            logs: list[str] = [
+                f"=== TEXT TAG CLEANUP  |  scope: {scope_label or folder}  |  dry={desc_dry} ===",
+                "Targets: DESCRIPTION, COMMENT, NOTES, NOTE (+ ID3 COMM)",
+                f"Files with matching tags: {len(hits)}",
+                "",
+            ]
+            action_logs: list[str] = []
+            error_logs: list[str] = []
+            ok_count = fail_count = 0
+            log_placeholder = st.empty()
+
+            if not hits:
+                logs.append("Nothing to clean up.")
+                st.success("No Description / Comment / Notes tags found in scope.")
+            else:
+                for i, (path, entries) in enumerate(hits, 1):
+                    try:
+                        rel = path.relative_to(folder)
+                    except ValueError:
+                        rel = path
+                    keys = ", ".join(k for k, _ in entries)
+                    preview = entries[0][1] if entries else ""
+                    preview_note = f" — {preview[:60]}" if preview else ""
+
+                    if desc_dry:
+                        line = f"DRY  would remove [{keys}]: {rel}{preview_note}"
+                        logs.append(line)
+                        action_logs.append(line)
+                        ok_count += 1
+                    else:
+                        success, msg, removed = remove_text_tags(path)
+                        if success and removed:
+                            line = f"✓ removed [{', '.join(removed)}]: {rel}"
+                            logs.append(line)
+                            action_logs.append(line)
+                            ok_count += 1
+                        elif success:
+                            line = f"↷ skipped (none found): {rel}"
+                            logs.append(line)
+                        else:
+                            line = f"✗ {rel} → {msg}"
+                            logs.append(line)
+                            error_logs.append(line)
+                            fail_count += 1
+
+                    if i % 20 == 0 or i == len(hits):
+                        log_placeholder.code(
+                            "\n".join(logs[-LOG_PREVIEW_LINES:]), language=None
+                        )
+
+                logs.append("")
+                if desc_dry:
+                    logs.append(
+                        f"Dry Run summary: {ok_count} file(s) would be cleaned. Nothing was modified."
+                    )
+                    st.success(
+                        f"Dry Run — **{ok_count}** file(s) have Description / Comment / Notes tags."
+                    )
+                else:
+                    logs.append(
+                        f"Summary: {ok_count} cleaned • {fail_count} failed • {len(hits)} total"
+                    )
+                    st.success(f"Done — **{ok_count}** cleaned • **{fail_count}** failed.")
+
+            show_scrollable_log(logs)
+            push_log_artifacts("text_tags", desc_dry, logs, action_logs, error_logs)
+            store_last_results("text_tags", logs, action_logs, error_logs, desc_dry)
+
+    render_persisted_results("text_tags")
 
 
 # ========== HISTORY ==========
